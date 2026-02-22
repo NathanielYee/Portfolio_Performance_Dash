@@ -22,6 +22,19 @@ def get_valid_start_date(d):
     if d.weekday() == 6: return d - timedelta(days=2)
     return d
 
+@st.cache_data(ttl=3600)
+def get_risk_free_rate():
+    """Fetch the current 10-Year Treasury yield from Yahoo Finance (^TNX)."""
+    try:
+        tnx = yf.Ticker("^TNX")
+        hist = tnx.history(period="5d")
+        if not hist.empty:
+            latest = hist['Close'].dropna().iloc[-1]
+            return latest / 100
+    except Exception:
+        pass
+    return None
+
 @st.cache_data
 def get_data(tickers, start, end):
     try:
@@ -36,30 +49,26 @@ def get_data(tickers, start, end):
         logger.error(f"Error fetching {tickers}: {e}")
         return pd.DataFrame()
 
+def calculate_max_drawdown(cum):
+    return (cum / cum.cummax() - 1.0).min()
+
 def calculate_metrics(daily_returns, rf):
     """Compute annualized metrics dynamically based on actual holding period."""
     n_days = len(daily_returns)
     if n_days == 0:
         return {}
 
-    # Annualization factor derived from actual trading days observed
     years_held = n_days / 252
-    ann_factor = 252 / n_days  # scales to 1 year
-
-    # Total cumulative return (actual, not annualized)
     cum_return = (1 + daily_returns).prod() - 1
 
-    # CAGR: geometrically correct annualized return
+    # CAGR
     ending_growth = 1 + cum_return
     if years_held > 0 and ending_growth > 0:
         cagr = ending_growth ** (1 / years_held) - 1
     else:
         cagr = 0.0
 
-    # Annualized volatility (sqrt-time scaling is standard for daily → annual)
     ann_vol = daily_returns.std() * np.sqrt(252)
-
-    # Sharpe using CAGR (not simple mean scaling)
     sharpe = (cagr - rf) / ann_vol if ann_vol != 0 else 0.0
 
     # Sortino: downside deviation only
@@ -83,9 +92,6 @@ def calculate_metrics(daily_returns, rf):
         'max_dd': max_dd,
         'calmar': calmar,
     }
-
-def calculate_max_drawdown(cum):
-    return (cum / cum.cummax() - 1.0).min()
 
 
 # ==========================================
@@ -172,7 +178,19 @@ def render_sidebar():
     benchmark_options = ["SPY", "QQQ", "DIA", "IWM", "BTC-USD"]
     benchmark_tickers = st.sidebar.multiselect("Compare against Benchmarks", benchmark_options, default=["SPY"])
     use_pct = st.sidebar.toggle("Show as % Return", value=True)
-    rf = st.sidebar.number_input("Risk-Free Rate (%)", value=4.5, step=0.1) / 100
+
+    # Risk-free rate: live 10Y yield with manual override
+    live_rf = get_risk_free_rate()
+    if live_rf is not None:
+        st.sidebar.markdown(f"**10Y Treasury Yield:** {live_rf:.2%} *(live via ^TNX)*")
+        rf_override = st.sidebar.toggle("Override risk-free rate manually", value=False)
+        if rf_override:
+            rf = st.sidebar.number_input("Manual Risk-Free Rate (%)", value=live_rf * 100, step=0.1) / 100
+        else:
+            rf = live_rf
+    else:
+        st.sidebar.warning("Could not fetch live 10Y yield. Enter manually:")
+        rf = st.sidebar.number_input("Risk-Free Rate (%)", value=4.5, step=0.1) / 100
 
     # Clean portfolio
     portfolio_df = portfolio_df.dropna(subset=['Ticker', 'Shares', 'Start Date'])
@@ -336,7 +354,7 @@ def show_main_page(portfolio_df, end_date, benchmark_tickers, use_pct, rf):
 
         with cr2:
             n_obs = len(portfolio_daily_returns)
-            w = min(60, max(10, n_obs // 5))  # dynamic window: 20% of history, clamped [10, 60]
+            w = min(60, max(10, n_obs // 5))
             r_mean = portfolio_daily_returns.rolling(window=w).mean()
             r_std = portfolio_daily_returns.rolling(window=w).std()
             r_sharpe = (r_mean / r_std) * np.sqrt(252)
@@ -445,7 +463,7 @@ def show_volatility_page(portfolio_df):
 
         if last_price:
             term_data = []
-            for exp in exps[:12]:  # limit to first 12 expirations
+            for exp in exps[:12]:
                 try:
                     chain = tk.option_chain(exp)
                     c = chain.calls.copy()
@@ -489,7 +507,6 @@ def show_volatility_page(portfolio_df):
                 rv = log_ret.rolling(window=w).std() * np.sqrt(252)
                 fig_hv.add_trace(go.Scatter(x=rv.index, y=rv, name=f'{w}D Realized Vol'))
 
-            # Overlay current near-term ATM IV as a horizontal line
             if term_data:
                 nearest_iv = term_data[0]['ATM IV']
                 fig_hv.add_hline(y=nearest_iv, line_dash="dash", line_color="red",
